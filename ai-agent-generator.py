@@ -13,7 +13,7 @@ from langchain.agents.output_parsers import ReActSingleInputOutputParser
 from langchain.tools.render import render_text_description
 from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, HarmCategory
 import google.generativeai as genai
-import json
+from langchain.output_parsers import PydanticOutputParser
 
 
 #use your own API key, from (https://makersuite.google.com/), remember to use VPN if you are not in US
@@ -43,11 +43,11 @@ safety_settings = [
 ]
 
 # Model name
-MODEL_NAME = "gemini-1.5-pro-latest"
+MODEL_NAME = "gemini-2.0-flash-001"
 
 # setup model
 llm = ChatGoogleGenerativeAI(
-    model="gemini-1.5-pro-latest",
+    model="gemini-2.0-flash-001",
     convert_system_message_to_human=True,
     temperature=1,
     top_p=0.95,
@@ -61,6 +61,7 @@ llm = ChatGoogleGenerativeAI(
     },
 )
 
+
 # agent_prompt = hub.pull("mikechan/gemini")
 # agent_prompt.template
 # prompt = "You are a helpful assistant."
@@ -70,35 +71,6 @@ llm = ChatGoogleGenerativeAI(
 #     tool_names=", ".join([t.name for t in tools]),
 # )
 
-# from langchain_core.prompts import ChatPromptTemplate
-
-# memory = ConversationBufferMemory(memory_key="chat_history")
-
-# agent = (
-#     {
-#         "input": lambda x: x["input"],
-#         "agent_scratchpad": lambda x: format_log_to_str(x["intermediate_steps"]),
-#         "chat_history": lambda x: x["chat_history"],
-#     }
-#     | prompt
-#     | llm
-#     | ReActSingleInputOutputParser()
-# )
-
-# prompt = "You are a helpful assistant."
-
-# agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, memory=memory)
-
-
-# planner_prompt = [
-#         (
-#             "system",
-#             """For the given objective, come up with a simple step by step plan. \
-# This plan should involve individual tasks, that if executed correctly will yield the correct answer. Do not add any superfluous steps. \
-# The result of the final step should be the final answer. Make sure that each step has all the information needed - do not skip steps.""",
-#         ),
-#         ("user", "what is the hometown of the current Australia open winner?")
-# ]
 
 
 # Function to send a message to the model
@@ -106,18 +78,18 @@ llm = ChatGoogleGenerativeAI(
 
 # for chunk in llm.stream(planner_prompt):
 #     print(chunk)
+# Planner
 from pydantic import BaseModel, Field
 from typing import List, Union
-
-
-class Plan():
-    """Plan to follow in future"""
-
-    steps: List[str] = Field(
-        description="different steps to follow, should be in sorted order"
-    )
-
 from langchain_core.prompts import ChatPromptTemplate
+
+
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.2, verbose=True)
+
+
+class Plan(BaseModel):
+    '''Plan to be aswesome'''
+    steps: str = Field(description="different steps to follow to be awesome")
 
 planner_prompt = ChatPromptTemplate.from_messages(
     [
@@ -130,25 +102,24 @@ The result of the final step should be the final answer. Make sure that each ste
         ("placeholder", "{messages}"),
     ]
 )
-
 planner = planner_prompt | llm.with_structured_output(Plan)
 
-planner.invoke(
-    {
+response = planner.invoke({
         "messages": [
             ("user", "what is the hometown of the current Australia open winner?")
         ]
-    }
-)
+    })
+print(response)
 
 
-class Response():
+## RePlanner, BaseModel should not be missed , which will cause title error
+class Response(BaseModel):
     """Response to user."""
 
     response: str
 
 
-class Act():
+class Act(BaseModel):
     """Action to perform."""
 
     action: Union[Response, Plan] = Field(
@@ -175,3 +146,123 @@ Update your plan accordingly. If no more steps are needed and you can return to 
 )
 
 replanner = replanner_prompt | llm.with_structured_output(Act)
+
+
+response = replanner.invoke(
+    {
+        "input": "what is the hometown of the current Australia open winner?",
+        "plan": ['Find the current Australian Open winner.', 'Find the hometown of the current Australian Open winner.'],
+        "past_steps": []
+    }
+)
+
+print(response)
+    
+
+from typing import Literal
+# from langgraph.graph import END
+import operator
+from typing import Annotated, List, Tuple
+from typing_extensions import TypedDict
+
+
+class PlanExecute(TypedDict):
+    input: str
+    plan: List[str]
+    past_steps: Annotated[List[Tuple], operator.add]
+    response: str
+
+agent_prompt = hub.pull("mikechan/gemini")
+agent_prompt.template
+
+memory = ConversationBufferMemory(memory_key="chat_history")
+#prompt should be defined as such to pass the agent
+prompt = agent_prompt.partial(
+    tools=render_text_description(tools),
+    tool_names=", ".join([t.name for t in tools]),
+)
+agent = (
+    {
+        "input": lambda x: x["input"],
+        "agent_scratchpad": lambda x: format_log_to_str(x["intermediate_steps"]),
+        "chat_history": lambda x: x["chat_history"],
+    }
+    | prompt
+    | llm
+    | ReActSingleInputOutputParser()
+)
+
+
+agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, memory=memory)
+
+
+async def execute_step(state: PlanExecute):
+    plan = state["plan"]
+    plan_str = "\n".join(f"{i+1}. {step}" for i, step in enumerate(plan))
+    task = plan[0]
+    task_formatted = f"""For the following plan:
+{plan_str}\n\nYou are tasked with executing step {1}, {task}."""
+    agent_response = await agent_executor.ainvoke(
+        {"messages": [("user", task_formatted)]}
+    )
+    return {
+        "past_steps": [(task, agent_response["messages"][-1].content)],
+    }
+
+
+async def plan_step(state: PlanExecute):
+    plan = await planner.ainvoke({"messages": [("user", state["input"])]})
+    return {"plan": plan.steps}
+
+
+async def replan_step(state: PlanExecute):
+    output = await replanner.ainvoke(state)
+    if isinstance(output.action, Response):
+        return {"response": output.action.response}
+    else:
+        return {"plan": output.action.steps}
+
+
+def should_end(state: PlanExecute):
+    if "response" in state and state["response"]:
+        return END
+    else:
+        return "agent"
+    
+# langgraph-checkpoint should be updated by pip3 uninstall reinstall
+from langgraph.graph import StateGraph, START, END
+
+workflow = StateGraph(PlanExecute)
+
+# Add the plan node
+workflow.add_node("planner", plan_step)
+
+# Add the execution step
+workflow.add_node("agent", execute_step)
+
+# Add a replan node
+workflow.add_node("replan", replan_step)
+
+workflow.add_edge(START, "planner")
+
+# From plan we go to agent
+workflow.add_edge("planner", "agent")
+
+# From agent, we replan
+workflow.add_edge("agent", "replan")
+
+workflow.add_conditional_edges(
+    "replan",
+    # Next, we pass in the function that will determine which node is called next.
+    should_end,
+    ["agent", END],
+)
+
+# Finally, we compile it!
+# This compiles it into a LangChain Runnable,
+# meaning you can use it as you would any other runnable
+app = workflow.compile()
+
+from IPython.display import Image, display # type: ignore
+
+display(Image(app.get_graph(xray=True).draw_mermaid_png()))
